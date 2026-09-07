@@ -855,7 +855,7 @@ public final class AdbDebuggingManagerTest {
     }
 
     @Test
-    public void testAdbKeyStore_networkIsTrustedIfOnlySsidMatch() throws Exception {
+    public void testAdbKeyStore_networkIsNotTrustedIfOnlySsidMatch() throws Exception {
         String trustedNetworkBssid = "My Network BSSID";
         String trustedNetworkSsid = "My Network SSID";
         mKeyStore.addTrustedNetwork(trustedNetworkBssid, trustedNetworkSsid);
@@ -867,9 +867,22 @@ public final class AdbDebuggingManagerTest {
                 mAdbKeyFile,
                 mFakeTicker);
 
-        assertTrue(
-                "Persisted trusted network not found in new keystore instance.",
+        assertFalse(
+                "SSID alone must never authorize another access point.",
                 newKeyStore.isTrustedNetwork("different BSSID", trustedNetworkSsid));
+    }
+
+    @Test
+    public void testAdbKeyStore_emptyBssidIsNeverTrusted() {
+        mKeyStore.addTrustedNetwork("", "same name");
+        assertFalse(mKeyStore.isTrustedNetwork("", "same name"));
+        assertFalse(mKeyStore.isTrustedNetwork(null, "same name"));
+    }
+
+    @Test
+    public void testAdbKeyStore_sameBssidRemainsTrustedAfterSsidChange() {
+        mKeyStore.addTrustedNetwork("access point", "old name");
+        assertTrue(mKeyStore.isTrustedNetwork("access point", "new name"));
     }
 
     @Test

@@ -24,6 +24,7 @@ import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.never;
 
 import android.content.ContentResolver;
 import android.content.Context;
@@ -90,7 +91,8 @@ public final class AdbWifiNetworkMonitorTest {
         mAdbWifiNetworkMonitor.register();
 
         verify(mConnectivityManager).registerNetworkCallback(
-                mNetworkRequestCaptor.capture(), any(ConnectivityManager.NetworkCallback.class));
+                mNetworkRequestCaptor.capture(), any(ConnectivityManager.NetworkCallback.class),
+                any(Handler.class));
     }
 
     @Test
@@ -288,7 +290,7 @@ public final class AdbWifiNetworkMonitorTest {
     }
 
     @Test
-    public void onCapabilitiesChanged_sameSsid_differentBssid_deduplicatesCallback() {
+    public void onCapabilitiesChanged_sameSsid_differentBssid_reauthorizesAccessPoint() {
         // given
         WifiInfo wifiInfo = new WifiInfo.Builder()
                 .setNetworkId(1)
@@ -317,7 +319,11 @@ public final class AdbWifiNetworkMonitorTest {
         mAdbWifiNetworkMonitor.onCapabilitiesChanged(mNetwork, networkCapabilities);
 
         // then
-        assertAdbWifiStarted();
+        verify(mAdbDebuggingHandler, times(2))
+                .sendMessageAtTime(mHandlerMessageCaptor.capture(), anyLong());
+        assertEquals(AdbDebuggingManager.AdbDebuggingHandler.MSG_START_TLS_SERVICE,
+                mHandlerMessageCaptor.getValue().what);
+        assertEquals("different_bssid", mHandlerMessageCaptor.getValue().obj);
     }
 
     @Test
@@ -370,7 +376,8 @@ public final class AdbWifiNetworkMonitorTest {
 
         // then
         verify(mConnectivityManager, times(1)).registerNetworkCallback(
-                any(NetworkRequest.class), any(ConnectivityManager.NetworkCallback.class));
+                any(NetworkRequest.class), any(ConnectivityManager.NetworkCallback.class),
+                any(Handler.class));
     }
 
     @Test
@@ -382,6 +389,27 @@ public final class AdbWifiNetworkMonitorTest {
         // then
         verify(mConnectivityManager, times(1)).unregisterNetworkCallback(
                 any(ConnectivityManager.NetworkCallback.class));
+    }
+
+    @Test
+    public void unregister_ignoresLateCallbacks() {
+        mAdbWifiNetworkMonitor.unregister();
+        mAdbWifiNetworkMonitor.onLost(mNetwork);
+        verify(mAdbDebuggingHandler, never()).sendMessageAtTime(any(Message.class), anyLong());
+    }
+
+    @Test
+    public void reregister_rejectsPreviousRegistrationCallback() {
+        ArgumentCaptor<ConnectivityManager.NetworkCallback> callbacks =
+                ArgumentCaptor.forClass(ConnectivityManager.NetworkCallback.class);
+        mAdbWifiNetworkMonitor.unregister();
+        mAdbWifiNetworkMonitor.register();
+        verify(mConnectivityManager, times(2)).registerNetworkCallback(
+                any(NetworkRequest.class), callbacks.capture(), any(Handler.class));
+        callbacks.getAllValues().get(0).onLost(mNetwork);
+        verify(mAdbDebuggingHandler, never()).sendMessageAtTime(any(Message.class), anyLong());
+        callbacks.getAllValues().get(1).onLost(mNetwork);
+        assertAdbWifiStopped();
     }
 
     private void assertAdbWifiStopped() {

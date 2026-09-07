@@ -316,15 +316,14 @@ class AdbKeyStore {
     }
 
     /**
-     * Returns whether the specified bssid or ssid is in the list of trusted networks. This requires
+     * Returns whether the exact BSSID is in the list of trusted access points. SSID is display
+     * information, never an authorization alternative. This requires
      * that the user previously allowed wireless debugging on this network and selected the option
      * to 'Always allow'.
      */
     synchronized boolean isTrustedNetwork(@NonNull String bssid, @NonNull String ssid) {
+        if (TextUtils.isEmpty(bssid)) return false;
         return mAuthEntries.trustedNetworks().stream()
-                .anyMatch(
-                        network ->
-                                TextUtils.equals(bssid, network.bssid())
-                                        || TextUtils.equals(ssid, network.ssid()));
+                .anyMatch(network -> TextUtils.equals(bssid, network.bssid()));
     }
 }

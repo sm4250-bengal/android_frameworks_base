@@ -33,10 +33,12 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.content.ActivityNotFoundException;
+import android.content.BroadcastReceiver;
 import android.content.ComponentName;
 import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.content.pm.UserInfo;
 import android.content.res.Resources;
@@ -679,6 +681,13 @@ public class AdbDebuggingManager {
 
         private final AdbDebuggingThread mThread;
 
+        // Handler-owned consent; volatile epochs also stamp public API messages at enqueue time.
+        private volatile int mWifiSessionEpoch;
+        private volatile int mWifiApprovalEpoch;
+        private int mWifiConsentUser = UserHandle.USER_NULL;
+        private String mPendingWifiBssid;
+        private String mOnceWifiBssid;
+
         private ContentObserver mAuthTimeObserver =
                 new ContentObserver(this) {
                     @Override
@@ -702,7 +711,18 @@ public class AdbDebuggingManager {
             }
             mThread = thread;
             if (com.android.server.adb.Flags.allowAdbWifiReconnect()) {
-                mAdbNetworkMonitor = new AdbWifiNetworkMonitor(mContext, this);
+                mAdbNetworkMonitor =
+                        new AdbWifiNetworkMonitor(mContext, this, () -> mWifiSessionEpoch);
+                mContext.registerReceiverForAllUsers(
+                        new BroadcastReceiver() {
+                            @Override
+                            public void onReceive(Context context, Intent intent) {
+                                if (Intent.ACTION_USER_SWITCHED.equals(intent.getAction())) {
+                                    revokeWifiConsent();
+                                }
+                            }
+                        },
+                        new IntentFilter(Intent.ACTION_USER_SWITCHED), null, this);
             } else {
                 mAdbNetworkMonitor = new AdbBroadcastReceiver(mContext, mAdbConnectionInfo);
             }
@@ -749,6 +769,116 @@ public class AdbDebuggingManager {
             } else {
                 AdbService.disableADBdWifi();
             }
+        }
+
+        // Bengal trusted reconnect: these methods run only with allow_adb_wifi_reconnect.
+        private boolean hasWifiConsent(int epoch) {
+            return mAdbWifiEnabled && epoch == mWifiSessionEpoch
+                    && mWifiConsentUser == ActivityManager.getCurrentUser();
+        }
+
+        private void clearWifiApproval() {
+            ++mWifiApprovalEpoch;
+            mPendingWifiBssid = null;
+        }
+
+        private void stopTrustedWifi() {
+            clearWifiApproval();
+            mOnceWifiBssid = null;
+            mAdbWirelessInfo = new AdbWirelessInfo(0, Optional.empty());
+            mAdbConnectionInfo.clear();
+            stopTLSPortPoller();
+            stopAdbdWifi();
+            onAdbdWifiServerDisconnected(-1);
+        }
+
+        private void disableTrustedWifi() {
+            ++mWifiSessionEpoch;
+            mAdbWifiEnabled = false;
+            mWifiConsentUser = UserHandle.USER_NULL;
+            mAdbNetworkMonitor.unregister();
+            stopTrustedWifi();
+        }
+
+        private void revokeWifiConsent() {
+            disableTrustedWifi();
+            Settings.Global.putInt(mContentResolver, Settings.Global.ADB_WIFI_ENABLED, 0);
+        }
+
+        private void enableTrustedWifi(int user) {
+            if (user != ActivityManager.getCurrentUser()) return;
+            if (mAdbWifiEnabled && mWifiConsentUser == user) return;
+            if (mAdbWifiEnabled) disableTrustedWifi();
+            ++mWifiSessionEpoch;
+            mWifiConsentUser = user;
+            mAdbWifiEnabled = true;
+            mAdbNetworkMonitor.register();
+            startTrustedWifi(mWifiSessionEpoch, null);
+        }
+
+        private void startTrustedWifi(int epoch, String eventBssid) {
+            if (!hasWifiConsent(epoch)) return;
+            AdbConnectionInfo info = getCurrentWifiApInfo();
+            if (info == null) {
+                stopTrustedWifi();
+                return;
+            }
+            String bssid = info.getBSSID();
+            // A queued network notification is not authority for another access point.
+            if (eventBssid != null && !eventBssid.equals(bssid)) {
+                if (!bssid.equals(mAdbConnectionInfo.getBSSID())) stopTrustedWifi();
+                return;
+            }
+            if (!bssid.equals(mAdbConnectionInfo.getBSSID())) {
+                // Stop the old listener before even asking about a newly observed access point.
+                if (!bssid.equals(mPendingWifiBssid)) stopTrustedWifi();
+            }
+            if (!mAdbKeyStore.isTrustedNetwork(bssid, info.getSSID())
+                    && !bssid.equals(mOnceWifiBssid)) {
+                if (!bssid.equals(mPendingWifiBssid)) {
+                    clearWifiApproval();
+                    mPendingWifiBssid = bssid;
+                    startConfirmationForNetwork(info.getSSID(), bssid);
+                }
+                return;
+            }
+            clearWifiApproval();
+            mAdbConnectionInfo.copy(info);
+            ensureAdbDebuggingThreadAlive();
+            stopTLSPortPoller();
+            startTLSPortPoller();
+            startAdbdWifi();
+            logAdbConnectionChanged(AdbProtoEnums.ADB_WIFI_AUTO_ENABLED);
+        }
+
+        private boolean hasWifiApproval(Bundle approval) {
+            return hasWifiConsent(approval.getInt("session_epoch"))
+                    && approval.getInt("approval_epoch") == mWifiApprovalEpoch
+                    && approval.getInt("user_id") == mWifiConsentUser
+                    && mPendingWifiBssid != null;
+        }
+
+        private void allowTrustedWifi(Bundle approval, boolean alwaysAllow) {
+            if (!hasWifiApproval(approval)) return;
+            String bssid = approval.getString("bssid");
+            AdbConnectionInfo info = getCurrentWifiApInfo();
+            // Check BEFORE persisting trust as well as before starting TLS.
+            if (info == null || !mPendingWifiBssid.equals(bssid)
+                    || !mPendingWifiBssid.equals(info.getBSSID())) return;
+            if (alwaysAllow) mAdbKeyStore.addTrustedNetwork(bssid, info.getSSID());
+            mOnceWifiBssid = bssid;
+            // Associate a one-time approval with this connection, not a future reconnect.
+            mAdbConnectionInfo.copy(info);
+            clearWifiApproval();
+            startTrustedWifi(mWifiSessionEpoch, bssid);
+        }
+
+        private Bundle wifiApprovalStamp() {
+            Bundle stamp = new Bundle();
+            stamp.putInt("session_epoch", mWifiSessionEpoch);
+            stamp.putInt("approval_epoch", mWifiApprovalEpoch);
+            stamp.putInt("user_id", ActivityManager.getCurrentUser());
+            return stamp;
         }
 
         // Cancels the pairing in progress, if any, and starts a new pairing session.
@@ -841,6 +971,9 @@ public class AdbDebuggingManager {
                     mConnectedKeys.clear();
                     mWifiConnectedKeys.clear();
                     mAdbKeyStore.deleteKeyStore();
+                    if (com.android.server.adb.Flags.allowAdbWifiReconnect()) {
+                        revokeWifiConsent();
+                    }
                     cancelJobToUpdateAdbKeyStore();
                     // Disconnect all active sessions unless the user opted out through Settings.
                     if (Settings.Global.getInt(
@@ -930,6 +1063,10 @@ public class AdbDebuggingManager {
                     }
                 }
                 case MSG_ADBDWIFI_ENABLE -> {
+                    if (com.android.server.adb.Flags.allowAdbWifiReconnect()) {
+                        enableTrustedWifi(msg.arg1);
+                        break;
+                    }
                     if (mAdbWifiEnabled) {
                         break;
                     }
@@ -974,6 +1111,10 @@ public class AdbDebuggingManager {
                     Slog.i(TAG, "adb start wireless adb");
                 }
                 case MSG_ADBDWIFI_DISABLE -> {
+                    if (com.android.server.adb.Flags.allowAdbWifiReconnect()) {
+                        disableTrustedWifi();
+                        break;
+                    }
                     if (!mAdbWifiEnabled) {
                         break;
                     }
@@ -986,6 +1127,10 @@ public class AdbDebuggingManager {
                     logAdbConnectionChanged(AdbProtoEnums.ADB_WIFI_DISABLED);
                 }
                 case MSG_START_TLS_SERVICE -> {
+                    if (com.android.server.adb.Flags.allowAdbWifiReconnect()) {
+                        startTrustedWifi(msg.arg1, (String) msg.obj);
+                        break;
+                    }
                     if (!mAdbWifiEnabled) {
                         break;
                     }
@@ -1006,6 +1151,10 @@ public class AdbDebuggingManager {
                     logAdbConnectionChanged(AdbProtoEnums.ADB_WIFI_AUTO_ENABLED);
                 }
                 case MSG_STOP_TLS_SERVICE -> {
+                    if (com.android.server.adb.Flags.allowAdbWifiReconnect()) {
+                        if (hasWifiConsent(msg.arg1)) stopTrustedWifi();
+                        break;
+                    }
                     if (!mAdbWifiEnabled) {
                         break;
                     }
@@ -1017,6 +1166,10 @@ public class AdbDebuggingManager {
                     logAdbConnectionChanged(AdbProtoEnums.ADB_WIFI_AUTO_DISABLED);
                 }
                 case MSG_ADBWIFI_ALLOW -> {
+                    if (com.android.server.adb.Flags.allowAdbWifiReconnect()) {
+                        allowTrustedWifi((Bundle) msg.obj, msg.arg1 == 1);
+                        break;
+                    }
                     if (!com.android.server.adb.Flags.allowAdbWifiReconnect()) {
                         if (mAdbWifiEnabled) {
                             break;
@@ -1026,9 +1179,6 @@ public class AdbDebuggingManager {
                     String bssid = bundle.getString("bssid");
                     String ssid = bundle.getString("ssid");
                     boolean alwaysAllow = msg.arg1 == 1;
-                    if (alwaysAllow) {
-                        mAdbKeyStore.addTrustedNetwork(bssid, ssid);
-                    }
                     logAdbConnectionChanged(
                             alwaysAllow
                                     ? AdbProtoEnums.ADB_WIFI_ALWAYS_ALLOW_NETWORK
@@ -1037,8 +1187,12 @@ public class AdbDebuggingManager {
                     // Let's check again to make sure we didn't switch networks while verifying
                     // the wifi network trust status.
                     AdbConnectionInfo newInfo = getCurrentWifiApInfo();
-                    if (newInfo == null || !ssid.equals(newInfo.getSSID())) {
+                    if (newInfo == null || TextUtils.isEmpty(bssid)
+                            || !bssid.equals(newInfo.getBSSID())) {
                         break;
+                    }
+                    if (alwaysAllow) {
+                        mAdbKeyStore.addTrustedNetwork(bssid, newInfo.getSSID());
                     }
 
                     mAdbConnectionInfo.copy(newInfo);
@@ -1055,6 +1209,10 @@ public class AdbDebuggingManager {
                     Slog.i(TAG, "adb start wireless adb");
                 }
                 case MSG_ADBWIFI_DENY -> {
+                    if (com.android.server.adb.Flags.allowAdbWifiReconnect()) {
+                        if (hasWifiApproval((Bundle) msg.obj)) stopTrustedWifi();
+                        break;
+                    }
                     if (!com.android.server.adb.Flags.allowAdbWifiReconnect()) {
                         Settings.Global.putInt(
                                 mContentResolver, Settings.Global.ADB_WIFI_ENABLED, 0);
@@ -1148,7 +1306,8 @@ public class AdbDebuggingManager {
                     if (mAdbWifiEnabled) {
                         if (com.android.server.adb.Flags.allowAdbWifiReconnect()) {
                             Slog.d(TAG, "Starting TLS service after adbd socket connected");
-                            mHandler.sendEmptyMessage(AdbDebuggingHandler.MSG_START_TLS_SERVICE);
+                            obtainMessage(MSG_START_TLS_SERVICE, mWifiSessionEpoch, 0)
+                                    .sendToTarget();
                         } else {
                             startTLSPortPoller();
                             if (wifiLifeCycleOverAdbdauthSupported()) {
@@ -1164,7 +1323,8 @@ public class AdbDebuggingManager {
                         mAdbdServicesManager.unregisterAll();
                         if (mAdbWifiEnabled) {
                             Slog.d(TAG, "Stopping TLS service after adbd socket disconnected");
-                            mHandler.sendEmptyMessage(AdbDebuggingHandler.MSG_STOP_TLS_SERVICE);
+                            obtainMessage(MSG_STOP_TLS_SERVICE, mWifiSessionEpoch, 0)
+                                    .sendToTarget();
                         }
                     } else if (mAdbWifiEnabled) {
                         onAdbdWifiServerDisconnected(-1);
@@ -1173,6 +1333,11 @@ public class AdbDebuggingManager {
                 }
                 case MESSAGE_KEY_FILES_UPDATED -> {
                     mAdbKeyStore.reloadKeyMap();
+                    if (com.android.server.adb.Flags.allowAdbWifiReconnect()) {
+                        // Reload is also a revocation boundary: discard approvals queued against
+                        // the previous authorization file, even when currently disconnected.
+                        revokeWifiConsent();
+                    }
                 }
                 case MSG_REGISTER_SERVICE -> {
                     Bundle bundle = (Bundle) msg.obj;
@@ -1597,10 +1762,11 @@ public class AdbDebuggingManager {
                                     ? AdbDebuggingHandler.MESSAGE_ADB_ENABLED
                                     : AdbDebuggingHandler.MESSAGE_ADB_DISABLED);
             case AdbTransportType.WIFI ->
-                    mHandler.sendEmptyMessage(
+                    mHandler.obtainMessage(
                             enabled
                                     ? AdbDebuggingHandler.MSG_ADBDWIFI_ENABLE
-                                    : AdbDebuggingHandler.MSG_ADBDWIFI_DISABLE);
+                                    : AdbDebuggingHandler.MSG_ADBDWIFI_DISABLE,
+                            ActivityManager.getCurrentUser(), 0).sendToTarget();
             case AdbTransportType.VSOCK ->
                     throw new IllegalArgumentException(
                             "AdbTransportType.VSOCK is not yet supported here");
@@ -1642,7 +1808,7 @@ public class AdbDebuggingManager {
     public void allowWirelessDebugging(boolean alwaysAllow, String bssid, String ssid) {
         Message msg = mHandler.obtainMessage(AdbDebuggingHandler.MSG_ADBWIFI_ALLOW);
         msg.arg1 = alwaysAllow ? 1 : 0;
-        Bundle bundle = new Bundle();
+        Bundle bundle = mHandler.wifiApprovalStamp();
         bundle.putString("bssid", bssid);
         bundle.putString("ssid", ssid);
         msg.obj = bundle;
@@ -1651,7 +1817,8 @@ public class AdbDebuggingManager {
 
     /** Denies wireless debugging connection on the last requested network. */
     public void denyWirelessDebugging() {
-        mHandler.sendEmptyMessage(AdbDebuggingHandler.MSG_ADBWIFI_DENY);
+        mHandler.obtainMessage(AdbDebuggingHandler.MSG_ADBWIFI_DENY,
+                mHandler.wifiApprovalStamp()).sendToTarget();
     }
 
     /** Returns the port adbwifi is currently opened on. */

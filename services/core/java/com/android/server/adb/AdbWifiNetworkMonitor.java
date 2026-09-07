@@ -32,6 +32,8 @@ import androidx.annotation.Nullable;
 
 import com.android.server.adb.AdbDebuggingManager.AdbDebuggingHandler;
 
+import java.util.function.IntSupplier;
+
 /**
  * Monitors Wi-Fi state changes to automatically enable ADB over Wi-Fi when the device connects to a
  * trusted network and disable it otherwise.
@@ -43,27 +45,37 @@ public class AdbWifiNetworkMonitor extends ConnectivityManager.NetworkCallback
 
     private final Context mContext;
     private final Handler mAdbDebuggingHandler;
+    private final IntSupplier mSessionEpoch;
+    private int mRegistration;
+    @Nullable private ConnectivityManager.NetworkCallback mCallback;
 
     /**
-     * Stores the SSID of the most recently processed network.
+     * Stores the BSSID of the most recently processed access point.
      *
      * <p>This is used to deduplicate callbacks, which may fire multiple times for the same network
-     * change event. By comparing against the last known SSID, we can ensure we only react to a
+     * change event. Comparing the exact BSSID ensures roaming to a same-SSID AP is reauthorized,
+     * rather than silently continuing a previously authorized TLS listener. We react to a
      * given network update once.
      */
-    @Nullable private String mLastSSID;
+    @Nullable private String mLastBSSID;
 
     private boolean mStarted = false;
 
     AdbWifiNetworkMonitor(
             @NonNull Context context,
             @NonNull Handler adbDebuggingHandler) {
+        this(context, adbDebuggingHandler, () -> 0);
+    }
+
+    AdbWifiNetworkMonitor(@NonNull Context context, @NonNull Handler adbDebuggingHandler,
+            @NonNull IntSupplier sessionEpoch) {
         // Flag is required to receive BSSID and SSID info in the callback.
         super(ConnectivityManager.NetworkCallback.FLAG_INCLUDE_LOCATION_INFO);
 
         mContext = context;
         mAdbDebuggingHandler = adbDebuggingHandler;
-        register();
+        mSessionEpoch = sessionEpoch;
+        // Construction is not user consent. Register only on explicit enable.
     }
 
     @Override
@@ -81,7 +93,24 @@ public class AdbWifiNetworkMonitor extends ConnectivityManager.NetworkCallback
                         // in the future. See b/201616245 for more information.
                         .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
                         .build();
-        connectivityManager.registerNetworkCallback(request, this);
+        final int registration = ++mRegistration;
+        mLastBSSID = null;
+        // Fresh callback per registration: callbacks already queued by the old
+        // registration cannot act after unregister/re-enable. Deliver on the
+        // ADB handler, the sole owner of the session and monitor state.
+        mCallback = new ConnectivityManager.NetworkCallback(FLAG_INCLUDE_LOCATION_INFO) {
+            @Override public void onCapabilitiesChanged(Network network, NetworkCapabilities caps) {
+                if (mStarted && registration == mRegistration) {
+                    AdbWifiNetworkMonitor.this.onCapabilitiesChanged(network, caps);
+                }
+            }
+            @Override public void onLost(Network network) {
+                if (mStarted && registration == mRegistration) {
+                    AdbWifiNetworkMonitor.this.onLost(network);
+                }
+            }
+        };
+        connectivityManager.registerNetworkCallback(request, mCallback, mAdbDebuggingHandler);
         mStarted = true;
     }
 
@@ -90,28 +119,34 @@ public class AdbWifiNetworkMonitor extends ConnectivityManager.NetworkCallback
         if (!mStarted) {
             return;
         }
+        mStarted = false;
+        ++mRegistration;
+        mLastBSSID = null;
         ConnectivityManager connectivityManager =
                 mContext.getSystemService(ConnectivityManager.class);
-        connectivityManager.unregisterNetworkCallback(this);
-        mStarted = false;
+        connectivityManager.unregisterNetworkCallback(mCallback);
+        mCallback = null;
     }
 
     @Override
     public final void onCapabilitiesChanged(
             @NonNull Network network, @NonNull NetworkCapabilities networkCapabilities) {
+        if (!mStarted) return;
         if (networkCapabilities.getTransportInfo() instanceof WifiInfo wifiInfo) {
             Slog.i(TAG, "Wi-Fi network available");
             processWifiConnection(wifiInfo);
         } else {
-            mAdbDebuggingHandler.sendEmptyMessage(AdbDebuggingHandler.MSG_STOP_TLS_SERVICE);
+            mLastBSSID = null;
+            sendNetworkMessage(AdbDebuggingHandler.MSG_STOP_TLS_SERVICE, null);
             Slog.i(TAG, "Wi-Fi network not available. Stopping adb over Wi-Fi.");
         }
     }
 
     @Override
     public final void onLost(@NonNull Network network) {
-        mLastSSID = null;
-        mAdbDebuggingHandler.sendEmptyMessage(AdbDebuggingHandler.MSG_STOP_TLS_SERVICE);
+        if (!mStarted) return;
+        mLastBSSID = null;
+        sendNetworkMessage(AdbDebuggingHandler.MSG_STOP_TLS_SERVICE, null);
         Slog.i(TAG, "Wi-Fi network lost. Stopping adb over Wi-Fi.");
     }
 
@@ -120,7 +155,8 @@ public class AdbWifiNetworkMonitor extends ConnectivityManager.NetworkCallback
                 || TextUtils.isEmpty(wifiInfo.getBSSID())
                 || TextUtils.isEmpty(wifiInfo.getSSID())
                 || TextUtils.equals(wifiInfo.getSSID(), WifiManager.UNKNOWN_SSID)) {
-            mAdbDebuggingHandler.sendEmptyMessage(AdbDebuggingHandler.MSG_STOP_TLS_SERVICE);
+            mLastBSSID = null;
+            sendNetworkMessage(AdbDebuggingHandler.MSG_STOP_TLS_SERVICE, null);
             Slog.i(
                     TAG,
                     TextUtils.formatSimple(
@@ -130,18 +166,22 @@ public class AdbWifiNetworkMonitor extends ConnectivityManager.NetworkCallback
             return;
         }
 
-        if (TextUtils.equals(wifiInfo.getSSID(), mLastSSID)) {
-            Slog.i(TAG, "Received the same Wi-Fi SSID. Ignoring.");
+        if (TextUtils.equals(wifiInfo.getBSSID(), mLastBSSID)) {
+            Slog.i(TAG, "Received the same Wi-Fi BSSID. Ignoring.");
             return;
         }
-        mLastSSID = wifiInfo.getSSID();
+        mLastBSSID = wifiInfo.getBSSID();
 
-        mAdbDebuggingHandler.sendEmptyMessage(AdbDebuggingHandler.MSG_START_TLS_SERVICE);
+        sendNetworkMessage(AdbDebuggingHandler.MSG_START_TLS_SERVICE, mLastBSSID);
         Slog.i(
                 TAG,
                 TextUtils.formatSimple(
                         "Connected to a Wi-Fi network {bssid=%s, ssid=%s}. Attempting to start adb"
                                 + " over Wi-Fi.",
                         wifiInfo.getBSSID(), wifiInfo.getSSID()));
+    }
+
+    private void sendNetworkMessage(int what, @Nullable String bssid) {
+        mAdbDebuggingHandler.obtainMessage(what, mSessionEpoch.getAsInt(), 0, bssid).sendToTarget();
     }
 }
