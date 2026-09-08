@@ -1276,9 +1276,10 @@ public class NetworkPolicyManagerService extends INetworkPolicyManager.Stub {
         }
     }
 
-    // Keep new platform transports allowed unless a policy explicitly rejects them.
-    private static final int MIN_TRANSPORT = NetworkCapabilities.MIN_TRANSPORT;
-    private static final int MAX_TRANSPORT = NetworkCapabilities.MAX_TRANSPORT;
+    // Use API-visible endpoints: NetworkCapabilities' MIN/MAX are hidden from
+    // the Connectivity stubs used by services.core. Keep all current transports.
+    private static final int MIN_TRANSPORT = NetworkCapabilities.TRANSPORT_CELLULAR;
+    private static final int MAX_TRANSPORT = NetworkCapabilities.TRANSPORT_SATELLITE;
     private static final int ALL_VALID_TRANSPORTS;
     static {
         int transports = 0;
@@ -1543,16 +1544,22 @@ public class NetworkPolicyManagerService extends INetworkPolicyManager.Stub {
         }
 
         private boolean isSystemApp(int uid) {
-            final String packageName = getPackageForUid(uid);
-            if (packageName == null) return false;
-            final ApplicationInfo appInfo;
-            try {
-                appInfo = mContext.getPackageManager().getApplicationInfo(packageName,
-                        PackageManager.MATCH_UNINSTALLED_PACKAGES);
-            } catch (PackageManager.NameNotFoundException ignored) {
-                return false;
+            final PackageManager pm = mContext.getPackageManager();
+            final String[] packages = pm.getPackagesForUid(uid);
+            if (packages == null) return false;
+            final int userId = UserHandle.getUserId(uid);
+            // Policy applies to the whole UID, including every shared-UID package.
+            for (String packageName : packages) {
+                if (packageName == null) continue;
+                try {
+                    final ApplicationInfo appInfo = pm.getApplicationInfoAsUser(packageName,
+                            PackageManager.MATCH_UNINSTALLED_PACKAGES, userId);
+                    if (appInfo.uid == uid && appInfo.isSystemApp()) return true;
+                } catch (PackageManager.NameNotFoundException ignored) {
+                    // A package can disappear between the UID and app-info queries.
+                }
             }
-            return appInfo.isSystemApp();
+            return false;
         }
     };
 
