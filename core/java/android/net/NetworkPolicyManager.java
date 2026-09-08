@@ -1220,7 +1220,7 @@ public class NetworkPolicyManager {
         }
     }
 
-    /** {@hide} */
+    /** @hide */
     public static class Listener extends INetworkPolicyListener.Stub {
         @Override public void onUidRulesChanged(int uid, int uidRules) { }
         @Override public void onMeteredIfacesChanged(String[] meteredIfaces) { }
