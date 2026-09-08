@@ -113,6 +113,9 @@ interface ISystemUiProxy {
     /** Sets home rotation enabled. */
     oneway void setHomeRotationEnabled(boolean enabled) = 45;
 
+    /** Notifies SystemUI of a navigation key long press. */
+    oneway void onLongPressKeyEvent(int keycode, int displayId) = 46;
+
     /** Notifies when taskbar status updated */
     oneway void notifyTaskbarStatus(boolean visible, boolean stashed) = 47;
 
@@ -201,5 +204,8 @@ interface ISystemUiProxy {
      */
     oneway void onOverviewHidden(int displayId) = 62;
 
-    // Next id = 63
+    /** Requests sleep for a launcher gesture. */
+    oneway void onSleepEvent(in MotionEvent event) = 63;
+
+    // Next id = 64
 }
