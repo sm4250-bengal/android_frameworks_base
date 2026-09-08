@@ -75,6 +75,9 @@ import static android.net.INetd.FIREWALL_RULE_ALLOW;
 import static android.net.INetd.FIREWALL_RULE_DENY;
 import static android.net.NetworkCapabilities.NET_CAPABILITY_NOT_METERED;
 import static android.net.NetworkCapabilities.NET_CAPABILITY_NOT_ROAMING;
+import static android.net.NetworkCapabilities.TRANSPORT_CELLULAR;
+import static android.net.NetworkCapabilities.TRANSPORT_VPN;
+import static android.net.NetworkCapabilities.TRANSPORT_WIFI;
 import static android.net.NetworkPolicy.LIMIT_DISABLED;
 import static android.net.NetworkPolicy.SNOOZE_NEVER;
 import static android.net.NetworkPolicy.WARNING_DISABLED;
@@ -98,7 +101,10 @@ import static android.net.NetworkPolicyManager.FOREGROUND_THRESHOLD_STATE;
 import static android.net.NetworkPolicyManager.POLICY_ALLOW_METERED_BACKGROUND;
 import static android.net.NetworkPolicyManager.POLICY_NONE;
 import static android.net.NetworkPolicyManager.POLICY_REJECT_ALL;
+import static android.net.NetworkPolicyManager.POLICY_REJECT_CELLULAR;
 import static android.net.NetworkPolicyManager.POLICY_REJECT_METERED_BACKGROUND;
+import static android.net.NetworkPolicyManager.POLICY_REJECT_VPN;
+import static android.net.NetworkPolicyManager.POLICY_REJECT_WIFI;
 import static android.net.NetworkPolicyManager.RULE_ALLOW_ALL;
 import static android.net.NetworkPolicyManager.RULE_NONE;
 import static android.net.NetworkPolicyManager.RULE_REJECT_ALL;
@@ -647,6 +653,8 @@ public class NetworkPolicyManagerService extends INetworkPolicyManager.Stub {
 
     @GuardedBy("mUidRulesFirstLock")
     final SparseIntArray mUidFirewallStandbyRules = new SparseIntArray();
+    @GuardedBy("mDisallowedUidsDenylist")
+    final Set<Integer> mDisallowedUidsDenylist = new ArraySet<Integer>();
 
     /** Set of states for the child firewall chains. True if the chain is active. */
     @GuardedBy("mUidRulesFirstLock")
@@ -1242,6 +1250,7 @@ public class NetworkPolicyManagerService extends INetworkPolicyManager.Stub {
             mAppStandby.addListener(new NetPolicyAppIdleStateChangeListener());
             synchronized (mUidRulesFirstLock) {
                 updateRulesForAppIdleParoleUL();
+                sendUidsAllowedTransportsUL();
             }
 
             // Listen for subscriber changes
@@ -1265,6 +1274,96 @@ public class NetworkPolicyManagerService extends INetworkPolicyManager.Stub {
             Process.setThreadPriority(oldPriority);
             Trace.traceEnd(Trace.TRACE_TAG_NETWORK);
         }
+    }
+
+    // Keep new platform transports allowed unless a policy explicitly rejects them.
+    private static final int MIN_TRANSPORT = NetworkCapabilities.MIN_TRANSPORT;
+    private static final int MAX_TRANSPORT = NetworkCapabilities.MAX_TRANSPORT;
+    private static final int ALL_VALID_TRANSPORTS;
+    static {
+        int transports = 0;
+        for (int i = MIN_TRANSPORT; i <= MAX_TRANSPORT; ++i) {
+            transports |= 1 << i;
+        }
+        ALL_VALID_TRANSPORTS = transports;
+    }
+
+    private static int getAllowedTransportsPackedForUidPolicy(int policy) {
+        // Enforce all-network rejection independently of optional restricted mode.
+        if ((policy & POLICY_REJECT_ALL) == POLICY_REJECT_ALL) {
+            return 0;
+        }
+        int allowedTransports = ALL_VALID_TRANSPORTS;
+        // Where policy rejects a transport, remove the flags that allow it.
+        if ((policy & POLICY_REJECT_VPN) == POLICY_REJECT_VPN) {
+            allowedTransports &= ~(1 << TRANSPORT_VPN);
+        }
+        if ((policy & POLICY_REJECT_WIFI) == POLICY_REJECT_WIFI) {
+            allowedTransports &= ~(1 << TRANSPORT_WIFI);
+        }
+        if ((policy & POLICY_REJECT_CELLULAR) == POLICY_REJECT_CELLULAR) {
+            allowedTransports &= ~(1 << TRANSPORT_CELLULAR);
+        }
+        return allowedTransports;
+    }
+
+    @GuardedBy("mUidRulesFirstLock")
+    private void sendUidsAllowedTransportsUL() {
+        final int size = mUidPolicy.size();
+        final int[] uids = new int[size];
+        final long[] allowedTransportsPacked = new long[size];
+        for (int i = 0; i < size; i++) {
+            final int uid = mUidPolicy.keyAt(i);
+            final int policy = mUidPolicy.valueAt(i);
+            uids[i] = uid;
+            allowedTransportsPacked[i] = getAllowedTransportsPackedForUidPolicy(policy);
+        }
+        dispatchUidsAllowedTransportsUL(uids, allowedTransportsPacked);
+    }
+
+    @GuardedBy("mUidRulesFirstLock")
+    private void dispatchUidsAllowedTransportsUL(@NonNull final int[] uids,
+            @NonNull final long[] transports) {
+        // Other policy broadcasts run on mHandler. Do not race beginBroadcast
+        // from a Binder caller or deliver callbacks while holding UID locks.
+        final int[] copiedUids = uids.clone();
+        final long[] copiedTransports = transports.clone();
+        mHandler.post(() -> {
+            final int length = mListeners.beginBroadcast();
+            try {
+                for (int i = 0; i < length; i++) {
+                    final INetworkPolicyListener listener = mListeners.getBroadcastItem(i);
+                    dispatchUidsAllowedTransportsChanged(listener, copiedUids, copiedTransports);
+                }
+            } finally {
+                mListeners.finishBroadcast();
+            }
+        });
+    }
+
+    @Override
+    public void notifyDenylistChanged(@NonNull final int[] uidsAdded,
+            @NonNull final int[] uidsRemoved) {
+        enforceAnyPermissionOf(PERMISSION_MAINLINE_NETWORK_STACK);
+        synchronized (mDisallowedUidsDenylist) {
+            for (final int uid : uidsAdded) {
+                mDisallowedUidsDenylist.add(uid);
+            }
+            for (final int uid : uidsRemoved) {
+                mDisallowedUidsDenylist.remove(uid);
+            }
+        }
+    }
+
+    @GuardedBy("mUidRulesFirstLock")
+    private void resetUidAllowedTransportsUL(int uid) {
+        synchronized (mDisallowedUidsDenylist) {
+            mDisallowedUidsDenylist.remove(uid);
+        }
+        // Connectivity retains the last mask even after our policy entry is gone.
+        // Queue the default so a reused UID does not retain the old restriction.
+        dispatchUidsAllowedTransportsUL(new int[] { uid },
+                new long[] { getAllowedTransportsPackedForUidPolicy(POLICY_NONE) });
     }
 
     public CountDownLatch networkScoreAndNetworkManagementServiceReady() {
@@ -1501,7 +1600,7 @@ public class NetworkPolicyManagerService extends INetworkPolicyManager.Stub {
                             addDefaultRestrictBackgroundAllowlistUidsUL(userId);
                         } else {
                             synchronized (mUidRulesFirstLock) {
-                                for (int i = 0; i < mUidPolicy.size(); i++) {
+                                for (int i = mUidPolicy.size() - 1; i >= 0; i--) {
                                     final int uid = mUidPolicy.keyAt(i);
                                     if (UserHandle.getUserId(uid) == userId) {
                                         mUidPolicy.delete(uid);
@@ -3387,6 +3486,14 @@ public class NetworkPolicyManagerService extends INetworkPolicyManager.Stub {
     private void setUidPolicyUncheckedUL(int uid, int oldPolicy, int policy, boolean persist) {
         setUidPolicyUncheckedUL(uid, policy, false);
 
+        final long lastAllowedTransportsPacked = getAllowedTransportsPackedForUidPolicy(oldPolicy);
+        final long allowedTransportsPacked = getAllowedTransportsPackedForUidPolicy(policy);
+
+        if (lastAllowedTransportsPacked != allowedTransportsPacked) {
+            dispatchUidsAllowedTransportsUL(new int[] { uid },
+                    new long[] { allowedTransportsPacked });
+        }
+
         final boolean notifyApp;
         if (!isUidValidForAllowlistRulesUL(uid)) {
             notifyApp = false;
@@ -3492,6 +3599,7 @@ public class NetworkPolicyManagerService extends INetworkPolicyManager.Stub {
         if (uids.length > 0) {
             for (int uid : uids) {
                 mUidPolicy.delete(uid);
+                resetUidAllowedTransportsUL(uid);
             }
             changed = true;
         }
@@ -4919,8 +5027,7 @@ public class NetworkPolicyManagerService extends INetworkPolicyManager.Stub {
 
     @GuardedBy("mUidRulesFirstLock")
     private int updateBlockedReasonsForRestrictedModeUL(int uid) {
-        final boolean hasRestrictedModeAccess = hasRestrictedModeAccess(uid)
-                || !isUidBlockedOnAllNetworks(uid);
+        final boolean hasRestrictedModeAccess = hasRestrictedModeAccess(uid);
         final int oldEffectiveBlockedReasons;
         final int newEffectiveBlockedReasons;
         final int uidRules;
@@ -4933,7 +5040,7 @@ public class NetworkPolicyManagerService extends INetworkPolicyManager.Stub {
             } else {
                 uidBlockedState.blockedReasons &= ~BLOCKED_REASON_RESTRICTED_MODE;
             }
-            if (hasRestrictedModeAccess || !hasInternetPermissionUL(uid)) {
+            if (hasRestrictedModeAccess) {
                 uidBlockedState.allowedReasons |= ALLOWED_REASON_RESTRICTED_MODE_PERMISSIONS;
             } else {
                 uidBlockedState.allowedReasons &= ~ALLOWED_REASON_RESTRICTED_MODE_PERMISSIONS;
@@ -5608,6 +5715,7 @@ public class NetworkPolicyManagerService extends INetworkPolicyManager.Stub {
         mUidState.delete(uid);
         mActivityManagerInternal.onUidBlockedReasonsChanged(uid, BLOCKED_REASON_NONE);
         mUidPolicy.delete(uid);
+        resetUidAllowedTransportsUL(uid);
         mUidFirewallStandbyRules.delete(uid);
         mBackgroundTransitioningUids.delete(uid);
         mPowerSaveWhitelistExceptIdleAppIds.delete(uid);
@@ -6025,6 +6133,15 @@ public class NetworkPolicyManagerService extends INetworkPolicyManager.Stub {
         }
     }
 
+    private void dispatchUidsAllowedTransportsChanged(INetworkPolicyListener listener, int[] uids,
+            long[] allowedTransports) {
+        try {
+            listener.onAllowedTransportsChanged(uids, allowedTransports);
+        } catch (RemoteException ignored) {
+            // Ignore if there is an error sending the callback to the client.
+        }
+    }
+
     private void dispatchSubscriptionOverride(INetworkPolicyListener listener, int subId,
             int overrideMask, int overrideValue, int[] networkTypes) {
         try {
@@ -6156,9 +6273,13 @@ public class NetworkPolicyManagerService extends INetworkPolicyManager.Stub {
                     final Boolean notifyApp = (Boolean) msg.obj;
                     // First notify internal listeners...
                     final int length = mListeners.beginBroadcast();
+                    final int[] uids = new int[] { uid };
+                    final long[] allowedTransports =
+                            new long[] { getAllowedTransportsPackedForUidPolicy(policy) };
                     for (int i = 0; i < length; i++) {
                         final INetworkPolicyListener listener = mListeners.getBroadcastItem(i);
                         dispatchUidPoliciesChanged(listener, uid, policy);
+                        dispatchUidsAllowedTransportsChanged(listener, uids, allowedTransports);
                     }
                     mListeners.finishBroadcast();
                     // ...then apps listening to ACTION_RESTRICT_BACKGROUND_CHANGED
@@ -6809,7 +6930,13 @@ public class NetworkPolicyManagerService extends INetworkPolicyManager.Stub {
 
         mStatLogger.logDurationStat(Stats.IS_UID_NETWORKING_BLOCKED, startTime);
 
-        return blockedReasons != BLOCKED_REASON_NONE;
+        if (blockedReasons != BLOCKED_REASON_NONE) {
+            return true;
+        } else {
+            synchronized (mDisallowedUidsDenylist) {
+                return mDisallowedUidsDenylist.contains(uid);
+            }
+        }
     }
 
     @EnforcePermission(OBSERVE_NETWORK_POLICY)

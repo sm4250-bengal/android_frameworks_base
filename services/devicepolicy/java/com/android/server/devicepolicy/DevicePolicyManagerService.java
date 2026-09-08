@@ -21629,7 +21629,7 @@ public class DevicePolicyManagerService extends IDevicePolicyManager.Stub
             Set<Integer> uids = ConnectivitySettingsManager.getUidsAllowedOnRestrictedNetworks(
                     mContext);
             uids.add(mContext.getPackageManager().getPackageUidAsUser(
-                    provisioningParams.getOwnerName(), userId));
+                    provisioningParams.getProfileAdminComponentName().getPackageName(), userId));
             ConnectivitySettingsManager.setUidsAllowedOnRestrictedNetworks(mContext, uids);
         } catch (NameNotFoundException ignored) {
         }

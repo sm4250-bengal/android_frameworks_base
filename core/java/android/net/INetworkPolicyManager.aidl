@@ -94,4 +94,6 @@ interface INetworkPolicyManager {
     boolean isUidNetworkingBlocked(int uid, boolean meteredNetwork);
     @EnforcePermission("OBSERVE_NETWORK_POLICY")
     boolean isUidRestrictedOnMeteredNetworks(int uid);
+
+    void notifyDenylistChanged(in int[] uidsAdded, in int[] uidsRemoved);
 }
