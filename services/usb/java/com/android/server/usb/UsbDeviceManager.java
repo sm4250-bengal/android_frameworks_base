@@ -1933,6 +1933,11 @@ public class UsbDeviceManager implements ActivityTaskManagerInternal.ScreenObser
         }
 
         protected long getChargingFunctions() {
+            // ACC preparation requests a real gadget disconnect. The normal
+            // charging fallback would silently re-enable MTP with ADB off.
+            if (Settings.Global.getInt(mContentResolver, "bengal_acc_quiesce", 0) != 0) {
+                return UsbManager.FUNCTION_NONE;
+            }
             // if ADB is enabled, reset functions to ADB
             // else enable MTP as usual.
             if (isAdbEnabled()) {
