@@ -2322,6 +2322,13 @@ public class UsbDeviceManager implements ActivityTaskManagerInternal.ScreenObser
             }
             functions = applyAdbFunction(functions);
 
+            // The bitmask API spells FUNCTION_NONE as an empty string, but
+            // legacy init triggers and sys.usb.state use the literal "none".
+            // This matters when ACC suppresses the charging/MTP fallback.
+            if (functions.isEmpty()) {
+                functions = UsbManager.USB_FUNCTION_NONE;
+            }
+
             String oemFunctions = applyOemOverrideFunction(functions);
 
             if (!isNormalBoot() && !mCurrentFunctionsStr.equals(functions)) {
