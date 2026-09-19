@@ -1255,4 +1255,6 @@
     Indicates whether to use the Alerts channel for storage notifications.
     -->
     <bool name="config_storageNotificationsUseAlertsChannel">false</bool>
+    <!-- Add Recovery and userspace Fastboot beside Restart in the power menu. -->
+    <bool name="config_showRecoveryRebootActions">false</bool>
 </resources>

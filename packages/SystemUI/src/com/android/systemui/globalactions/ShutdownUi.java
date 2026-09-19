@@ -162,6 +162,10 @@ public class ShutdownUi {
         if (reason != null && reason.startsWith(PowerManager.REBOOT_RECOVERY_UPDATE)) {
             return R.string.reboot_to_update_reboot;
         } else if (reason != null && reason.equals(PowerManager.REBOOT_RECOVERY)) {
+            if (mContext.getResources().getBoolean(
+                    com.android.systemui.res.R.bool.config_showRecoveryRebootActions)) {
+                return com.android.systemui.res.R.string.reboot_to_recovery_message;
+            }
             return R.string.reboot_to_reset_message;
         } else if (isReboot) {
             return R.string.reboot_to_reset_message;
@@ -176,6 +180,11 @@ public class ShutdownUi {
         if (reason != null && reason.startsWith(PowerManager.REBOOT_RECOVERY_UPDATE)) {
             return mContext.getString(R.string.reboot_to_update_title);
         } else if (reason != null && reason.equals(PowerManager.REBOOT_RECOVERY)) {
+            if (mContext.getResources().getBoolean(
+                    com.android.systemui.res.R.bool.config_showRecoveryRebootActions)) {
+                // Recovery is also a user-selected boot target, not necessarily a data reset.
+                return mContext.getString(com.android.systemui.res.R.string.global_action_recovery);
+            }
             return mContext.getString(R.string.reboot_to_reset_title);
         } else {
             return null;

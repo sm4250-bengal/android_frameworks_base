@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Power menu action: restart into the installed recovery environment. -->
+    <string name="global_action_recovery">Recovery</string>
+    <!-- Power menu action: restart into userspace fastboot (fastbootd). -->
+    <string name="global_action_fastboot">Fastboot</string>
+    <!-- Progress message while rebooting into the recovery environment. -->
+    <string name="reboot_to_recovery_message">Restarting to recovery\u2026</string>
+</resources>

@@ -746,6 +746,17 @@ public class GlobalActionsDialogLite implements DialogInterface.OnDismissListene
                     break;
                 case RESTART:
                     addIfShouldShowAction(tempActions, restartAction);
+                    if (mResources.getBoolean(
+                            com.android.systemui.res.R.bool.config_showRecoveryRebootActions)) {
+                        addIfShouldShowAction(tempActions, new RebootModeAction(
+                                com.android.systemui.res.R.drawable.ic_global_actions_recovery,
+                                com.android.systemui.res.R.string.global_action_recovery,
+                                PowerManager.REBOOT_RECOVERY));
+                        addIfShouldShowAction(tempActions, new RebootModeAction(
+                                com.android.systemui.res.R.drawable.ic_global_actions_fastboot,
+                                com.android.systemui.res.R.string.global_action_fastboot,
+                                "fastboot")); // init routes this to recovery's fastbootd.
+                    }
                     break;
                 case SCREENSHOT:
                     addIfShouldShowAction(tempActions, new ScreenshotAction());
@@ -1119,6 +1130,43 @@ public class GlobalActionsDialogLite implements DialogInterface.OnDismissListene
             }
             mUiEventLogger.log(GlobalActionsEvent.GA_REBOOT_PRESS);
             mWindowManagerFuncs.reboot(false);
+        }
+    }
+
+    /** Uses the normal framework shutdown path, including recovery/fastbootd BCB handling. */
+    @VisibleForTesting
+    final class RebootModeAction extends SinglePressAction {
+        private final String mReason;
+
+        RebootModeAction(int iconResId, int messageResId, String reason) {
+            super(iconResId, messageResId);
+            mReason = reason;
+        }
+
+        @Override
+        public boolean showDuringKeyguard() {
+            return false;
+        }
+
+        @Override
+        public boolean showBeforeProvisioning() {
+            return false;
+        }
+
+        @Override
+        public boolean shouldShow() {
+            return !mUserManager.hasUserRestrictionForUser(UserManager.DISALLOW_DEBUGGING_FEATURES,
+                    mUserTracker.getUserHandle());
+        }
+
+        @Override
+        public void onPress() {
+            if (ActivityManager.isUserAMonkey() || !mDeviceProvisioned
+                    || mKeyguardStateController.isShowing() || !shouldShow()) {
+                return;
+            }
+            mUiEventLogger.log(GlobalActionsEvent.GA_REBOOT_PRESS);
+            mBackgroundExecutor.execute(() -> mPowerManager.reboot(mReason));
         }
     }
 

@@ -58,6 +58,8 @@ public class ShutdownUiTest extends SysuiTestCase {
     public void setUp() throws Exception {
         MockitoAnnotations.initMocks(this);
         mContext = spy(mContext);
+        mContext.getOrCreateTestableResources().addOverride(
+                com.android.systemui.res.R.bool.config_showRecoveryRebootActions, false);
         mShutdownUi = new ShutdownUi(mContext, mNearbyManager);
     }
 
@@ -89,6 +91,16 @@ public class ShutdownUiTest extends SysuiTestCase {
     public void getReasonMessage_rebootDefault() {
         String message = mShutdownUi.getReasonMessage(PowerManager.REBOOT_RECOVERY);
         assertEquals(message, mContext.getString(R.string.reboot_to_reset_title));
+    }
+
+    @Test
+    public void recoveryMenu_rebootDoesNotClaimFactoryReset() {
+        mContext.getOrCreateTestableResources().addOverride(
+                com.android.systemui.res.R.bool.config_showRecoveryRebootActions, true);
+        assertEquals(mContext.getString(com.android.systemui.res.R.string.global_action_recovery),
+                mShutdownUi.getReasonMessage(PowerManager.REBOOT_RECOVERY));
+        assertEquals(com.android.systemui.res.R.string.reboot_to_recovery_message,
+                mShutdownUi.getRebootMessage(true, PowerManager.REBOOT_RECOVERY));
     }
 
     @Test
