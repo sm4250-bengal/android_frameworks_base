@@ -325,6 +325,10 @@ public class PackageInstallerService extends IPackageInstaller.Stub implements
         }
     }
 
+    // Serializes the snapshot and complete AtomicFile transaction. Never acquire while
+    // holding mSessions, a session's mLock or mDeveloperVerificationPolicyPerUser.
+    private final Object mSessionsWriteLock = new Object();
+
     @NonNull
     private final RequestThrottle mSettingsWriteRequest = new RequestThrottle(IoThread.getHandler(),
             () -> {
@@ -691,6 +695,13 @@ public class PackageInstallerService extends IPackageInstaller.Stub implements
     }
 
     private boolean writeSessions() {
+        synchronized (mSessionsWriteLock) {
+            return writeSessionsLocked();
+        }
+    }
+
+    @GuardedBy("mSessionsWriteLock")
+    private boolean writeSessionsLocked() {
         if (LOGD) Slog.v(TAG, "writeSessions()");
         final PackageInstallerSession[] sessions;
         synchronized (mSessions) {
@@ -2730,9 +2741,9 @@ public class PackageInstallerService extends IPackageInstaller.Stub implements
                         if (appIconFile.exists()) {
                             appIconFile.delete();
                         }
-
-                        mSettingsWriteRequest.runNow();
                     }
+                    // Do not wait for the writer while holding the session collection lock.
+                    mSettingsWriteRequest.runNow();
                     if (!success) {
                         mCallbacks.notifySessionFinished(
                                 session.sessionId, session.userId, success);
