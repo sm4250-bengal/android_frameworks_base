@@ -75,8 +75,11 @@ class DeferredDisplayUpdater {
         out.canHostTasks = override.canHostTasks;
         out.state = override.state;
 
-        // Also apply WM-override fields, since they might produce differences in window hierarchy
+        // Also apply WM-override fields, since they might produce differences in window hierarchy.
+        // Flags, including WM scaling policy, remain immediate rather than deferrable.
+        final int flags = out.flags;
         WM_OVERRIDE_FIELDS.setFields(out, override);
+        out.flags = flags;
     };
 
     private static final String TAG = "DeferredDisplayUpdater";

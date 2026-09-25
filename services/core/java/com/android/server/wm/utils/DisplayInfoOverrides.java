@@ -18,6 +18,7 @@ package com.android.server.wm.utils;
 
 import android.annotation.NonNull;
 import android.annotation.Nullable;
+import android.view.Display;
 import android.view.DisplayInfo;
 
 import java.util.EnumSet;
@@ -33,6 +34,9 @@ public class DisplayInfoOverrides {
      * WindowManager. Any changes to the fields in here need to update {@link #WM_OVERRIDE_GROUPS}.
      */
     public static final DisplayInfoFieldsUpdater WM_OVERRIDE_FIELDS = (out, source) -> {
+        // WindowManager owns scaling policy, but all other flags belong to the base display.
+        out.flags = (out.flags & ~Display.FLAG_SCALING_DISABLED)
+                | (source.flags & Display.FLAG_SCALING_DISABLED);
         out.appWidth = source.appWidth;
         out.appHeight = source.appHeight;
         out.smallestNominalAppWidth = source.smallestNominalAppWidth;
@@ -57,7 +61,8 @@ public class DisplayInfoOverrides {
      */
     public static final int WM_OVERRIDE_GROUPS =
             DisplayInfo.DisplayInfoGroup.ORIENTATION_AND_ROTATION.getMask()
-                    | DisplayInfo.DisplayInfoGroup.DIMENSIONS_AND_SHAPES.getMask();
+                    | DisplayInfo.DisplayInfoGroup.DIMENSIONS_AND_SHAPES.getMask()
+                    | DisplayInfo.DisplayInfoGroup.BASIC_PROPERTIES.getMask();
 
     /**
      * Same as {@link #WM_OVERRIDE_GROUPS}, but as an EnumSet.
@@ -66,7 +71,8 @@ public class DisplayInfoOverrides {
      */
     public static final EnumSet<DisplayInfo.DisplayInfoGroup> WM_OVERRIDE_GROUPS_ENUMSET =
             EnumSet.of(DisplayInfo.DisplayInfoGroup.ORIENTATION_AND_ROTATION,
-                    DisplayInfo.DisplayInfoGroup.DIMENSIONS_AND_SHAPES);
+                    DisplayInfo.DisplayInfoGroup.DIMENSIONS_AND_SHAPES,
+                    DisplayInfo.DisplayInfoGroup.BASIC_PROPERTIES);
 
     /**
      * Gets {@code base} DisplayInfo, overrides WindowManager-specific overrides using

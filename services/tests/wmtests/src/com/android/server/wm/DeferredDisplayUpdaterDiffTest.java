@@ -133,6 +133,9 @@ public class DeferredDisplayUpdaterDiffTest {
         final DisplayInfo info1 = new DisplayInfo();
         final DisplayInfo info2 = new DisplayInfo();
         makeAllFieldsDifferent(info1, info2);
+        // The flags field is only partially overridden; exercise its WM-owned bit.
+        info1.flags = 0;
+        info2.flags = Display.FLAG_SCALING_DISABLED;
 
         final DisplayInfo result = new DisplayInfo();
         result.copyFrom(info1);
